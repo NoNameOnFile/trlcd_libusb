@@ -12,7 +12,9 @@ User service:
 ```bash
 ./install.sh --user
 systemctl --user restart trlcd
-
+sudo ./install.sh --system
+sudo systemctl restart trlcd
+```
 
 Tiny single-file C program that composites PNG layers + text (with alpha) into RGB565 and streams frames to a 240×320 USB LCD (VID:PID **0416:5302**) over **libusb**.
 
