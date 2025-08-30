@@ -1,4 +1,18 @@
-# trlcd_libusb
+# trlcd_libusb ThermalRight AIO Cooler LCD driver
+
+
+### What’s new
+- **Installer**: `./install.sh --user` or `sudo ./install.sh --system`
+- **APNG**: per-frame decode is tolerant (LodePNG first, stb_image fallback)
+- **USB**: better recovery (soft clear → reset → reopen)
+- **Docs**: clarified asset locations for services
+
+### Upgrade
+User service:
+```bash
+./install.sh --user
+systemctl --user restart trlcd
+
 
 Tiny single-file C program that composites PNG layers + text (with alpha) into RGB565 and streams frames to a 240×320 USB LCD (VID:PID **0416:5302**) over **libusb**.
 
