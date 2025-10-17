@@ -85,6 +85,14 @@ ensure_deps() {
     say "Installing libusb development headers"
     pkg_install libusb-1.0-0-dev || pkg_install libusb-devel || pkg_install libusb
   fi
+  # FFmpeg dev headers (best-effort check)
+  if ! echo '#include <libavformat/avformat.h>' | cpp -H -o /dev/null 2>&1 | grep -q libavformat ; then
+    say "Installing FFmpeg development headers"
+    pkg_install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev || \
+    pkg_install ffmpeg-devel || \
+    pkg_install ffmpeg4-dev || \
+    pkg_install ffmpeg
+  fi
 }
 
 build_binary() {
@@ -96,7 +104,7 @@ build_binary() {
   [[ -f "${SRC_LODE}" && -f "${HDR_LODE}" ]] || die "lodepng.c/h not found in repo"
   [[ -f "${HDR_STBI}" && -f "${HDR_STBT}" ]] || die "stb headers not found in repo"
   say "Building ${BIN_NAME}"
-  local cmd=(gcc -O2 -Wall "${SRC_MAIN}" "${SRC_LODE}" -lusb-1.0 -lm -o "${REPO_DIR}/${BIN_NAME}")
+  local cmd=(gcc -O2 -Wall "${SRC_MAIN}" "${SRC_LODE}" -lusb-1.0 -lavformat -lavcodec -lavutil -lswscale -lm -o "${REPO_DIR}/${BIN_NAME}")
   echo "    ${cmd[*]}"
   if [[ "${DRY_RUN}" != "yes" ]]; then
     "${cmd[@]}"
