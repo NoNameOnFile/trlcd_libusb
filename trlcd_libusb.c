@@ -1,19 +1,21 @@
-// trlcd_libusb.c — USB LCD compositor with PNG/APNG, UTF-8 TTF text, overlays,
+// trlcd_libusb.c — USB LCD compositor with PNG/APNG/Video, UTF-8 TTF text, overlays,
 // robust USB retries, big FB + viewport. APNG frames are precomposed with
-// correct blend/dispose and timed playback.
+// correct blend/dispose and timed playback. Video support via FFmpeg.
 //
 // Build:
-//   gcc -O2 -Wall trlcd_libusb.c lodepng.c -lusb-1.0 -lm -o trlcd_libusb
+//   gcc -O2 -Wall trlcd_libusb.c lodepng.c -lusb-1.0 -lavformat -lavcodec -lavutil -lswscale -lm -o trlcd_libusb
 //
 // Requires (in same directory):
 //   - stb_image.h        (PNG decode for static images)
 //   - stb_truetype.h     (TTF text rasterization)
 //   - lodepng.h, lodepng.c (APNG frame decode)
+//   - FFmpeg libraries   (libavformat, libavcodec, libavutil, libswscale)
 //
 // Notes:
 //   * Background offset can be numeric or "center" (layout.cfg)
 //   * Text is TTF-only; bitmap font removed.
-//   * Tokens: %CPU_TEMP% %CPU_USAGE% %MEM_USED% %MEM_FREE% %GPU_TEMP% %GPU_USAGE% %TIME% %DATE%
+//   * Tokens: %CPU_TEMP% %CPU_USAGE% %MEM_USED% %MEM_FREE% %GPU_TEMP% %GPU_USAGE% %TIME% %DATE% %FAN_RPM% %FAN_SPEED% %CPU_FREQ% %UPTIME% %LOAD_AVG%
+//   * Video backgrounds supported via FFmpeg (MP4, AVI, MOV, etc.)
 
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -31,6 +33,19 @@
 #include <math.h>
 
 #include <signal.h>
+
+// FFmpeg includes
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libavutil/opt.h>
+
+// FFmpeg compatibility
+#ifndef AV_PIX_FMT_RGBA
+#define AV_PIX_FMT_RGBA AV_PIX_FMT_RGB32
+#endif
 
 static volatile sig_atomic_t g_reload = 0;
 static volatile sig_atomic_t g_stop   = 0;
@@ -141,6 +156,7 @@ typedef struct {
 typedef struct {
     // Background
     char background_png[512];
+    char background_video[512];  // Video file path
     int  background_flip;   // 0|1
     int  bg_x_mode;         // 0 numeric, 1 center
     int  bg_y_mode;         // 0 numeric, 1 center
@@ -160,6 +176,8 @@ typedef struct {
     int fps;
     int once;
     int iface;
+    
+    // Compression (removed - LCD only supports RGB565)
 
     // Objects
     Overlay  *overlays; int n_overlays;
@@ -176,8 +194,12 @@ typedef struct {
     int bg_apng_loop_mode; // 0 default(file) 1 inf 2 once 3 customN
     int bg_apng_loop_N;
 
-    // Debug
-    int debug;
+    // Background video controls
+    double bg_video_speed;
+    int64_t bg_video_start_ms;
+    int bg_video_loop_mode; // 0 default(file) 1 inf 2 once 3 customN
+    int bg_video_loop_N;
+    int video_cache_enabled; // Enable video caching for short videos
 } Layout;
 
 static UiOrient parse_orient(const char *v){
@@ -187,7 +209,9 @@ static UiOrient parse_orient(const char *v){
 static int parse_rect(const char *s, int *x,int *y,int *w,int *h){
     int X=0,Y=0,Wd=0,Ht=0;
     int n = sscanf(s," %d , %d , %d , %d ",&X,&Y,&Wd,&Ht);
-    if(n!=4) return -1; *x=X; *y=Y; *w=Wd; *h=Ht; return 0;
+    if(n!=4) return -1; 
+    *x=X; *y=Y; *w=Wd; *h=Ht; 
+    return 0;
 }
 static int parse_rgbA(const char *s, uint8_t *r,uint8_t *g,uint8_t *b,uint8_t *a){
     int R=0,G=0,B=0,A=255;
@@ -213,23 +237,28 @@ static void layout_init(Layout *L){
     L->text_orient=ORIENT_PORTRAIT;
     L->text_flip=0;
     L->text_landscape_ccw=0;
+    // Compression settings removed - LCD only supports RGB565
     L->fb_scale_percent=150;
     L->viewport_x=-1; L->viewport_y=-1;
     L->default_ttf[0]=0; L->default_ttf_px=0;
     L->bg_apng_speed=1.0; L->bg_apng_start_ms=0; L->bg_apng_loop_mode=0; L->bg_apng_loop_N=0;
-    L->debug=0;
+    L->bg_video_speed=1.0; L->bg_video_start_ms=0; L->bg_video_loop_mode=1; L->bg_video_loop_N=0; // default infinite loop
+    L->video_cache_enabled=1; // Enable video caching by default
 }
 static void add_overlay(Layout *L, Overlay ov){
     L->overlays=(Overlay*)realloc(L->overlays,(L->n_overlays+1)*sizeof(Overlay));
-    if(!L->overlays) die("realloc overlays"); L->overlays[L->n_overlays++]=ov;
+    if(!L->overlays) die("realloc overlays"); 
+    L->overlays[L->n_overlays++]=ov;
 }
 static void add_text(Layout *L, TextItem ti){
     L->texts=(TextItem*)realloc(L->texts,(L->n_texts+1)*sizeof(TextItem));
-    if(!L->texts) die("realloc texts"); L->texts[L->n_texts++]=ti;
+    if(!L->texts) die("realloc texts"); 
+    L->texts[L->n_texts++]=ti;
 }
 static void add_img(Layout *L, ImgLayer im){
     L->imgs=(ImgLayer*)realloc(L->imgs,(L->n_imgs+1)*sizeof(ImgLayer));
-    if(!L->imgs) die("realloc imgs"); L->imgs[L->n_imgs++]=im;
+    if(!L->imgs) die("realloc imgs"); 
+    L->imgs[L->n_imgs++]=im;
 }
 static int load_layout(const char *path, Layout *L){
     layout_init(L);
@@ -263,22 +292,61 @@ static int load_layout(const char *path, Layout *L){
 
         if(sec==SEC_NONE){
             if(!strcmp(k,"background_png")) { strncpy(L->background_png,v,sizeof(L->background_png)-1); }
+            else if(!strcmp(k,"background_video")) { strncpy(L->background_video,v,sizeof(L->background_video)-1); }
             else if(!strcmp(k,"background_flip")) L->background_flip=atoi(v);
-            else if(!strcmp(k,"background_x")){ if(strcasecmp(v,"center")==0)L->bg_x_mode=1; else{L->bg_x_mode=0; L->bg_x=atoi(v);} }
-            else if(!strcmp(k,"background_y")){ if(strcasecmp(v,"center")==0)L->bg_y_mode=1; else{L->bg_y_mode=0; L->bg_y=atoi(v);} }
+            else if(!strcmp(k,"background_x")){ 
+                // Strip comments from value
+                char *comment = strchr(v, '#');
+                if(comment) *comment = 0;
+                // Trim whitespace
+                while(*v && (*v == ' ' || *v == '\t')) v++;
+                char *end = v + strlen(v) - 1;
+                while(end > v && (*end == ' ' || *end == '\t')) *end-- = 0;
+                
+                if(strcasecmp(v,"center")==0)L->bg_x_mode=1; else{L->bg_x_mode=0; L->bg_x=atoi(v);} 
+            }
+            else if(!strcmp(k,"background_y")){ 
+                // Strip comments from value
+                char *comment = strchr(v, '#');
+                if(comment) *comment = 0;
+                // Trim whitespace
+                while(*v && (*v == ' ' || *v == '\t')) v++;
+                char *end = v + strlen(v) - 1;
+                while(end > v && (*end == ' ' || *end == '\t')) *end-- = 0;
+                
+                if(strcasecmp(v,"center")==0)L->bg_y_mode=1; else{L->bg_y_mode=0; L->bg_y=atoi(v);} 
+            }
 
             else if(!strcmp(k,"text_orientation")) L->text_orient=parse_orient(v);
             else if(!strcmp(k,"text_flip")) L->text_flip=atoi(v);
             else if(!strcmp(k,"text_landscape_dir")) L->text_landscape_ccw=(strcasecmp(v,"ccw")==0)?1:0;
 
             else if(!strcmp(k,"fb_scale_percent")) L->fb_scale_percent=atoi(v);
-            else if(!strcmp(k,"viewport_x")) L->viewport_x=(strcasecmp(v,"center")==0)?-1:atoi(v);
-            else if(!strcmp(k,"viewport_y")) L->viewport_y=(strcasecmp(v,"center")==0)?-1:atoi(v);
+            else if(!strcmp(k,"viewport_x")) {
+                // Strip comments from value
+                char *comment = strchr(v, '#');
+                if(comment) *comment = 0;
+                // Trim trailing whitespace
+                char *end = v + strlen(v) - 1;
+                while(end > v && (*end == ' ' || *end == '\t')) *end-- = 0;
+                
+                L->viewport_x=(strcasecmp(v,"center")==0)?-1:atoi(v);
+            }
+            else if(!strcmp(k,"viewport_y")) {
+                // Strip comments from value
+                char *comment = strchr(v, '#');
+                if(comment) *comment = 0;
+                // Trim trailing whitespace
+                char *end = v + strlen(v) - 1;
+                while(end > v && (*end == ' ' || *end == '\t')) *end-- = 0;
+                
+                L->viewport_y=(strcasecmp(v,"center")==0)?-1:atoi(v);
+            }
 
             else if(!strcmp(k,"fps")) L->fps=atoi(v);
             else if(!strcmp(k,"once")) L->once=atoi(v);
             else if(!strcmp(k,"iface")) L->iface=atoi(v);
-            else if(!strcmp(k,"debug")) L->debug=atoi(v);
+            // Compression config removed - LCD only supports RGB565
 
             else if(!strcmp(k,"default_ttf")) { strncpy(L->default_ttf,v,sizeof(L->default_ttf)-1); }
             else if(!strcmp(k,"default_ttf_px")) L->default_ttf_px=atoi(v);
@@ -292,6 +360,17 @@ static int load_layout(const char *path, Layout *L){
                 else if(!strcasecmp(v,"once")){ L->bg_apng_loop_mode=2; }
                 else { L->bg_apng_loop_mode=3; L->bg_apng_loop_N=atoi(v); if(L->bg_apng_loop_N<0)L->bg_apng_loop_N=0; }
             }
+
+            // background video tuning
+            else if(!strcmp(k,"video_speed")) L->bg_video_speed=atof(v);
+            else if(!strcmp(k,"video_start_ms")) L->bg_video_start_ms=(int64_t)atoll(v);
+            else if(!strcmp(k,"video_loop")){
+                if(!strcasecmp(v,"default")){ L->bg_video_loop_mode=0; }
+                else if(!strcasecmp(v,"infinite")){ L->bg_video_loop_mode=1; }
+                else if(!strcasecmp(v,"once")){ L->bg_video_loop_mode=2; }
+                else { L->bg_video_loop_mode=3; L->bg_video_loop_N=atoi(v); if(L->bg_video_loop_N<0)L->bg_video_loop_N=0; }
+            }
+            else if(!strcmp(k,"video_cache_enabled")) L->video_cache_enabled=atoi(v);
 
         } else if(sec==SEC_OVERLAY){
             static Overlay ov;
@@ -322,7 +401,8 @@ static int load_layout(const char *path, Layout *L){
                 int tmp; if(parse_bool_inherit(v,&tmp)==0) cur_text.flip_override=tmp;
                 else fprintf(stderr,"[text] flip must be 0|1|true|false|yes|no|inherit\n");
             } else if(!strcmp(k,"ttf")){
-                if(cur_text.ttf_path) free(cur_text.ttf_path); cur_text.ttf_path=strdup(v);
+                if(cur_text.ttf_path) free(cur_text.ttf_path);
+                cur_text.ttf_path=strdup(v);
             } else if(!strcmp(k,"ttf_px")){
                 cur_text.ttf_px=atoi(v);
             }
@@ -350,9 +430,10 @@ static int load_layout(const char *path, Layout *L){
     else if(cur_img.path){ free(cur_img.path); }
     fclose(f);
 
-    if(L->background_png[0]==0){ fprintf(stderr,"layout.cfg missing 'background_png='\n"); return -1; }
+    if(L->background_png[0]==0 && L->background_video[0]==0){ fprintf(stderr,"layout.cfg missing 'background_png=' or 'background_video='\n"); return -1; }
     if(L->fb_scale_percent<100) L->fb_scale_percent=100;
     if(L->bg_apng_speed<=0) L->bg_apng_speed=1.0;
+    if(L->bg_video_speed<=0) L->bg_video_speed=1.0;
     for(int i=0;i<L->n_imgs;i++){ if(L->imgs[i].apng_speed<=0) L->imgs[i].apng_speed=1.0; }
 
     return 0;
@@ -365,8 +446,18 @@ typedef struct {
     int have_mem; unsigned long long mem_total_kb, mem_avail_kb;
     int have_gpu_temp; float gpu_temp_c;
     int have_gpu_usage; float gpu_usage_pct;
+    int have_fan_rpm; int fan_rpm;
+    int have_fan_speed; float fan_speed_pct;
+    int have_disk_usage; float disk_usage_pct;
+    int have_disk_free; unsigned long long disk_free_gb;
+    int have_cpu_freq; float cpu_freq_ghz;
+    int have_uptime; unsigned long uptime_sec;
+    int have_load_avg; float load_avg_1m;
     char time_hhmm[8];
-    char date_ymd[16];
+    char date_ymd[32];
+    // Optimization: cache timestamps
+    uint64_t last_update_ms;
+    int cache_valid;
 } Metrics;
 
 static int read_file_ll(const char *path, long long *out){
@@ -380,18 +471,44 @@ static int read_file_u64(const char *path, unsigned long long *out){
 }
 static int get_cpu_temp_c(float *out_c){
     long long best=-1;
-    for(int i=0;i<32;i++){ char p[128]; snprintf(p,sizeof p,"/sys/class/thermal/thermal_zone%d/temp",i);
-        long long v; if(read_file_ll(p,&v)==0){ if(v>1000) v=(v+5)/10; if(v>best) best=v; } }
-    for(int h=0;h<16;h++)for(int t=1;t<=8;t++){ char p[160]; snprintf(p,sizeof p,"/sys/class/hwmon/hwmon%d/temp%d_input",h,t);
-        long long v; if(read_file_ll(p,&v)==0){ if(v>1000) v=v/100; if(v>best) best=v; } }
-    if(best<0) return -1; *out_c = best/10.0f; return 0;
+    
+    // First try hwmon sensors (prefer k10temp for AMD CPUs)
+    for(int h=0;h<16;h++)for(int t=1;t<=8;t++){ 
+        char p[160]; 
+        snprintf(p,sizeof p,"/sys/class/hwmon/hwmon%d/temp%d_input",h,t);
+        long long v; 
+        if(read_file_ll(p,&v)==0){ 
+            if(v>1000) v=v/1000; // Convert millidegrees to degrees
+            if(v>best) best=v; 
+        } 
+    }
+    
+    // Fallback to thermal zones if no hwmon sensors found
+    if(best < 0) {
+        for(int i=0;i<32;i++){ 
+            char p[128]; 
+            snprintf(p,sizeof p,"/sys/class/thermal/thermal_zone%d/temp",i);
+            long long v; 
+            if(read_file_ll(p,&v)==0){ 
+                if(v>1000) v=v/100; // Convert centidegrees to degrees
+                if(v>best) best=v; 
+            } 
+        }
+    }
+    
+    if(best<0) return -1; 
+    *out_c = best; 
+    return 0;
 }
 static int read_cpu_totals(uint64_t *idle, uint64_t *total){
     FILE *f=fopen("/proc/stat","r"); if(!f) return -1; char line[256];
     if(!fgets(line,sizeof line,f)){ fclose(f); return -1; } fclose(f);
     unsigned long long u=0,n=0,s=0,i=0,w=0,irq=0,sirq=0,st=0;
     int c=sscanf(line,"cpu %llu %llu %llu %llu %llu %llu %llu %llu",&u,&n,&s,&i,&w,&irq,&sirq,&st);
-    if(c<4) return -1; *idle = i+w; *total = u+n+s+*idle+irq+sirq+st; return 0;
+    if(c<4) return -1; 
+    *idle = i+w; 
+    *total = u+n+s+*idle+irq+sirq+st; 
+    return 0;
 }
 static int get_mem_total_avail_kb(unsigned long long *tot_kb, unsigned long long *avail_kb){
     FILE *f=fopen("/proc/meminfo","r"); if(!f) return -1; char key[64]; unsigned long long val=0; char unit[16];
@@ -404,17 +521,20 @@ static int get_gpu_temp_c(float *out_c){
     for(int h=0;h<32;h++){
         char namep[128]; snprintf(namep,sizeof namep,"/sys/class/hwmon/hwmon%d/name",h);
         FILE *nf=fopen(namep,"r"); if(!nf) continue; char nm[64]={0}; if(!fgets(nm,sizeof nm,nf)){ fclose(nf); continue; } fclose(nf);
-        for(char *p=nm;*p;p++) if(*p=='\n'||*p=='\r') *p=0; int ok=0;
+        for(char *p=nm;*p;p++) if(*p=='\n'||*p=='\r') *p=0; 
+        int ok=0;
         for(size_t i=0;i<sizeof(names)/sizeof(names[0]);i++) if(!strcasecmp(nm,names[i])){ ok=1; break; }
         if(!ok) continue;
         for(int t=1;t<=8;t++){ char tp[160]; snprintf(tp,sizeof tp,"/sys/class/hwmon/hwmon%d/temp%d_input",h,t);
             long long v; if(read_file_ll(tp,&v)==0){ float c=(v>=1000)?(v/1000.0f):(v/1.0f); if(c>best) best=c; } }
     }
-    if(best<0) return -1; *out_c=best; return 0;
+    if(best<0) return -1; 
+    *out_c=best; 
+    return 0;
 }
 static int get_gpu_usage_pct(float *out_pct){
     DIR *d=opendir("/sys/class/drm"); if(!d) return -1; struct dirent *de; float best=-1.0f;
-    while((de=readdir(d))){ if(strncmp(de->d_name,"card",4)!=0) continue; char p1[256]; unsigned long long v=0;
+    while((de=readdir(d))){ if(strncmp(de->d_name,"card",4)!=0) continue; char p1[512]; unsigned long long v=0;
         snprintf(p1,sizeof p1,"/sys/class/drm/%s/device/gpu_busy_percent",de->d_name);
         if(read_file_u64(p1,&v)==0){ if((float)v>best) best=(float)v; continue; }
         snprintf(p1,sizeof p1,"/sys/class/drm/%s/device/busy_percent",de->d_name);
@@ -423,6 +543,93 @@ static int get_gpu_usage_pct(float *out_pct){
         if(read_file_u64(p1,&v)==0){ if((float)v>best) best=(float)v; continue; }
     }
     closedir(d); if(best<0) return -1; if(best>100.0f) best=100.0f; *out_pct=best; return 0;
+}
+
+// New metric collection functions
+static int get_fan_rpm(int *out_rpm){
+    int best_rpm = -1;
+    for(int h=0; h<16; h++){
+        for(int f=1; f<=8; f++){
+            char path[160];
+            snprintf(path, sizeof path, "/sys/class/hwmon/hwmon%d/fan%d_input", h, f);
+            long long rpm;
+            if(read_file_ll(path, &rpm) == 0 && rpm > 0){
+                if(rpm > best_rpm) best_rpm = (int)rpm;
+            }
+        }
+    }
+    if(best_rpm < 0) return -1;
+    *out_rpm = best_rpm;
+    return 0;
+}
+
+static int get_fan_speed_pct(float *out_pct){
+    int best_pct = -1;
+    for(int h=0; h<16; h++){
+        for(int f=1; f<=8; f++){
+            char path[160];
+            snprintf(path, sizeof path, "/sys/class/hwmon/hwmon%d/pwm%d", h, f);
+            long long pwm;
+            if(read_file_ll(path, &pwm) == 0 && pwm >= 0){
+                // PWM is typically 0-255, convert to percentage
+                int pct = (int)((pwm * 100) / 255);
+                if(pct > best_pct) best_pct = pct;
+            }
+        }
+    }
+    if(best_pct < 0) return -1;
+    *out_pct = (float)best_pct;
+    return 0;
+}
+
+static int get_cpu_freq_ghz(float *out_ghz){
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if(!f) return -1;
+    
+    char line[256];
+    float max_freq = 0.0f;
+    while(fgets(line, sizeof line, f)){
+        if(strncmp(line, "cpu MHz", 7) == 0){
+            float freq_mhz;
+            if(sscanf(line, "cpu MHz : %f", &freq_mhz) == 1){
+                float freq_ghz = freq_mhz / 1000.0f;
+                if(freq_ghz > max_freq) max_freq = freq_ghz;
+            }
+        }
+    }
+    fclose(f);
+    
+    if(max_freq <= 0) return -1;
+    *out_ghz = max_freq;
+    return 0;
+}
+
+static int get_uptime_sec(unsigned long *out_sec){
+    FILE *f = fopen("/proc/uptime", "r");
+    if(!f) return -1;
+    
+    double uptime;
+    if(fscanf(f, "%lf", &uptime) == 1){
+        *out_sec = (unsigned long)uptime;
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
+static int get_load_avg_1m(float *out_load){
+    FILE *f = fopen("/proc/loadavg", "r");
+    if(!f) return -1;
+    
+    float load1, load5, load15;
+    if(fscanf(f, "%f %f %f", &load1, &load5, &load15) == 3){
+        *out_load = load1;
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return -1;
 }
 static void metrics_init(Metrics *m){ memset(m,0,sizeof *m); }
 static void fmt_bytes_short(unsigned long long bytes, char out[16]){
@@ -433,38 +640,54 @@ static void fmt_bytes_short(unsigned long long bytes, char out[16]){
     else snprintf(out,16,"%.2f%s",v,u[idx]);
 }
 static void update_metrics(Metrics *m, int blocking_initial){
+    uint64_t now_ms = now_monotonic_ms();
+    
+    // Always update time/date (lightweight)
     time_t now=time(NULL); struct tm lt; localtime_r(&now,&lt);
     snprintf(m->time_hhmm,sizeof m->time_hhmm,"%02d:%02d", lt.tm_hour, lt.tm_min);
     snprintf(m->date_ymd,sizeof m->date_ymd,"%04d-%02d-%02d", lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday);
 
-    float tc; if(get_cpu_temp_c(&tc)==0){ m->have_temp=1; m->temp_c=tc; }
+    // Cache expensive system calls for 1 second
+    if(blocking_initial || !m->cache_valid || (now_ms - m->last_update_ms) > 1000){
+        float tc; if(get_cpu_temp_c(&tc)==0){ m->have_temp=1; m->temp_c=tc; }
 
-    uint64_t idle=0,total=0;
-    if(read_cpu_totals(&idle,&total)==0){
-        if(!m->prev_valid){
-            if(blocking_initial){
-                struct timespec ts={0,60*1000*1000}; nanosleep(&ts,NULL);
-                uint64_t i2=0,t2=0; if(read_cpu_totals(&i2,&t2)==0){
-                    uint64_t did=i2-idle, dtt=t2-total; if(dtt>0){
-                        float used=(float)(dtt-did)*100.0f/(float)dtt; if(used<0)used=0; if(used>100)used=100;
-                        m->usage_pct=used; m->have_usage=1;
+        uint64_t idle=0,total=0;
+        if(read_cpu_totals(&idle,&total)==0){
+            if(!m->prev_valid){
+                if(blocking_initial){
+                    struct timespec ts={0,60*1000*1000}; nanosleep(&ts,NULL);
+                    uint64_t i2=0,t2=0; if(read_cpu_totals(&i2,&t2)==0){
+                        uint64_t did=i2-idle, dtt=t2-total; if(dtt>0){
+                            float used=(float)(dtt-did)*100.0f/(float)dtt; if(used<0)used=0; if(used>100)used=100;
+                            m->usage_pct=used; m->have_usage=1;
+                        }
+                        m->prev_idle=i2; m->prev_total=t2; m->prev_valid=1;
                     }
-                    m->prev_idle=i2; m->prev_total=t2; m->prev_valid=1;
+                } else { m->prev_idle=idle; m->prev_total=total; m->prev_valid=1; }
+            } else {
+                uint64_t did=idle-m->prev_idle, dtt=total-m->prev_total; if(dtt>0){
+                    float used=(float)(dtt-did)*100.0f/(float)dtt; if(used<0)used=0; if(used>100)used=100;
+                    m->usage_pct=used; m->have_usage=1;
                 }
-            } else { m->prev_idle=idle; m->prev_total=total; m->prev_valid=1; }
-        } else {
-            uint64_t did=idle-m->prev_idle, dtt=total-m->prev_total; if(dtt>0){
-                float used=(float)(dtt-did)*100.0f/(float)dtt; if(used<0)used=0; if(used>100)used=100;
-                m->usage_pct=used; m->have_usage=1;
+                m->prev_idle=idle; m->prev_total=total;
             }
-            m->prev_idle=idle; m->prev_total=total;
         }
-    }
-    unsigned long long tot=0, avail=0;
-    if(get_mem_total_avail_kb(&tot,&avail)==0){ m->mem_total_kb=tot; m->mem_avail_kb=avail; m->have_mem=1; }
+        unsigned long long tot=0, avail=0;
+        if(get_mem_total_avail_kb(&tot,&avail)==0){ m->mem_total_kb=tot; m->mem_avail_kb=avail; m->have_mem=1; }
 
-    float gtc; if(get_gpu_temp_c(&gtc)==0){ m->gpu_temp_c=gtc; m->have_gpu_temp=1; }
-    float gup; if(get_gpu_usage_pct(&gup)==0){ if(gup<0)gup=0; if(gup>100)gup=100; m->gpu_usage_pct=gup; m->have_gpu_usage=1; }
+        float gtc; if(get_gpu_temp_c(&gtc)==0){ m->gpu_temp_c=gtc; m->have_gpu_temp=1; }
+        float gup; if(get_gpu_usage_pct(&gup)==0){ if(gup<0)gup=0; if(gup>100)gup=100; m->gpu_usage_pct=gup; m->have_gpu_usage=1; }
+
+        // New metrics
+        int fan_rpm; if(get_fan_rpm(&fan_rpm)==0){ m->fan_rpm=fan_rpm; m->have_fan_rpm=1; }
+        float fan_speed; if(get_fan_speed_pct(&fan_speed)==0){ m->fan_speed_pct=fan_speed; m->have_fan_speed=1; }
+        float cpu_freq; if(get_cpu_freq_ghz(&cpu_freq)==0){ m->cpu_freq_ghz=cpu_freq; m->have_cpu_freq=1; }
+        unsigned long uptime; if(get_uptime_sec(&uptime)==0){ m->uptime_sec=uptime; m->have_uptime=1; }
+        float load_avg; if(get_load_avg_1m(&load_avg)==0){ m->load_avg_1m=load_avg; m->have_load_avg=1; }
+        
+        m->last_update_ms = now_ms;
+        m->cache_valid = 1;
+    }
 }
 static void expand_tokens(char *out, size_t outsz, const char *in, const Metrics *m){
     size_t oi=0;
@@ -484,6 +707,11 @@ static void expand_tokens(char *out, size_t outsz, const char *in, const Metrics
                     else if(!strcmp(tok,"GPU_USAGE")){ if(m&&m->have_gpu_usage){ int p=(int)(m->gpu_usage_pct+0.5f); if(p<0)p=0; if(p>100)p=100; snprintf(repl,64,"%d%%",p);} else snprintf(repl,64,"N/A"); replaced=1; }
                     else if(!strcmp(tok,"TIME")){ snprintf(repl,64,"%s",(m&&m->time_hhmm[0])?m->time_hhmm:"N/A"); replaced=1; }
                     else if(!strcmp(tok,"DATE")){ snprintf(repl,64,"%s",(m&&m->date_ymd[0])?m->date_ymd:"N/A"); replaced=1; }
+                    else if(!strcmp(tok,"FAN_RPM")){ if(m&&m->have_fan_rpm){ snprintf(repl,64,"%d RPM",m->fan_rpm);} else snprintf(repl,64,"N/A"); replaced=1; }
+                    else if(!strcmp(tok,"FAN_SPEED")){ if(m&&m->have_fan_speed){ int p=(int)(m->fan_speed_pct+0.5f); if(p<0)p=0; if(p>100)p=100; snprintf(repl,64,"%d%%",p);} else snprintf(repl,64,"N/A"); replaced=1; }
+                    else if(!strcmp(tok,"CPU_FREQ")){ if(m&&m->have_cpu_freq){ snprintf(repl,64,"%.2f GHz",m->cpu_freq_ghz);} else snprintf(repl,64,"N/A"); replaced=1; }
+                    else if(!strcmp(tok,"UPTIME")){ if(m&&m->have_uptime){ unsigned long days=m->uptime_sec/86400; unsigned long hours=(m->uptime_sec%86400)/3600; unsigned long mins=(m->uptime_sec%3600)/60; if(days>0) snprintf(repl,64,"%lud %luh %lum",days,hours,mins); else if(hours>0) snprintf(repl,64,"%luh %lum",hours,mins); else snprintf(repl,64,"%lum",mins);} else snprintf(repl,64,"N/A"); replaced=1; }
+                    else if(!strcmp(tok,"LOAD_AVG")){ if(m&&m->have_load_avg){ snprintf(repl,64,"%.2f",m->load_avg_1m);} else snprintf(repl,64,"N/A"); replaced=1; }
                     if(replaced){ size_t rl=strlen(repl); for(size_t r=0;r<rl && oi+1<outsz;r++) out[oi++]=repl[r]; i+=(len+2); continue; }
                 }
             }
@@ -519,6 +747,11 @@ static inline void over_premul(uint8_t *dst, const uint8_t *src){
 static uint8_t* fb_rgba_alloc_clear(int fbw, int fbh){
     uint8_t *fb=(uint8_t*)calloc((size_t)fbw*fbh,4); if(!fb) die("calloc fb"); return fb;
 }
+
+// JPEG compression removed - LCD does not support JPEG format
+
+// RLE compression removed - LCD does not support RLE format
+
 static void blit_png_into_fb(uint8_t *fb,int fbw,int fbh,const uint8_t *src,int sw,int sh,int dstx,int dsty,int alpha,float scale){
     if(scale<=0.0f) scale=1.0f;
     int outw=(int)(sw*scale), outh=(int)(sh*scale);
@@ -561,7 +794,8 @@ static inline void put_px_ui(uint8_t *fb,int fbw,int fbh,int xL,int yL,UiOrient 
 static void draw_overlay_ui(uint8_t *fb,int fbw,int fbh,Overlay ov, UiOrient o,int flip180,const Layout *L){
     int LW=(o==ORIENT_PORTRAIT)?W:H, LH=(o==ORIENT_PORTRAIT)?H:W;
     int x0=ov.x<0?0:ov.x, y0=ov.y<0?0:ov.y, x1=ov.x+ov.w, y1=ov.y+ov.h;
-    if(x1>LW)x1=LW; if(y1>LH)y1=LH;
+    if(x1>LW)x1=LW;
+    if(y1>LH)y1=LH;
     for(int y=y0;y<y1;y++) for(int x=x0;x<x1;x++) put_px_ui(fb,fbw,fbh,x,y,o,flip180,ov.r,ov.g,ov.b,ov.a,L);
 }
 
@@ -584,7 +818,11 @@ static TtfCache* ttf_get(const char *path, int px){
     stbtt_fontinfo info; if(!stbtt_InitFont(&info,data,stbtt_GetFontOffsetForIndex(data,0))){ free(data); fprintf(stderr,"ttf init failed: %s\n",path); return NULL; }
     float scale=stbtt_ScaleForPixelHeight(&info,(float)px); int a,d,lg; stbtt_GetFontVMetrics(&info,&a,&d,&lg);
     TtfCache *c=&g_ttf_cache[slot]; if(c->valid && c->ttf_data) free(c->ttf_data); memset(c,0,sizeof *c);
-    strncpy(c->path,path,sizeof(c->path)-1); c->px=px; c->ttf_data=data; c->ttf_size=(size_t)sz; c->info=info;
+    size_t path_len = strlen(path);
+    if(path_len >= sizeof(c->path)) path_len = sizeof(c->path) - 1;
+    memcpy(c->path, path, path_len);
+    c->path[path_len] = '\0';
+    c->px=px; c->ttf_data=data; c->ttf_size=(size_t)sz; c->info=info;
     c->scale=scale; c->ascent=a; c->descent=d; c->lineGap=lg; c->valid=1; return c;
 }
 static const unsigned char* utf8_next(const unsigned char *s, int *cp){
@@ -695,8 +933,6 @@ static void write_chunk(ByteVec *v, const char type[4], const unsigned char *dat
 }
 
 typedef struct { const unsigned char *p; size_t left; } Reader;
-static int rd_read(Reader *r, unsigned char *out, size_t n){ if(r->left<n) return -1; memcpy(out,r->p,n); r->p+=n; r->left-=n; return 0; }
-static int rd_skip(Reader *r, size_t n){ if(r->left<n) return -1; r->p+=n; r->left-=n; return 0; }
 
 typedef struct { unsigned char *data; size_t len; } Chunk;
 static int next_chunk(Reader *r, Chunk *ch){
@@ -711,7 +947,7 @@ static int next_chunk(Reader *r, Chunk *ch){
     return 1;
 }
 static const unsigned char* chunk_type_ptr(const Chunk *ch){ return ch->data+4; }
-static const unsigned char* chunk_dataptr(const Chunk *ch){ uint32_t len=be32r(ch->data); return ch->data+8; }
+static const unsigned char* chunk_dataptr(const Chunk *ch){ return ch->data+8; }
 static uint32_t chunk_datalen(const Chunk *ch){ return be32r(ch->data); }
 
 // Precompose APNG into full frames (fixed fcTL offsets; robust tiny-PNG build)
@@ -732,7 +968,7 @@ static int apng_load_precompose(const char *path, ApngAnim *A, int rotate180_all
     // Parse IHDR and collect safe header chunks (before first IDAT/fdAT)
     unsigned char ihdr_base[13]={0}; int ihdr_base_set=0;
     Chunk ch; ByteVec header_chunks; bv_init(&header_chunks);
-    unsigned acTL_frames=0, acTL_plays=0;
+    unsigned acTL_plays=0;
     int saw_acTL=0, saw_IDAT_or_fd=0;
 
     typedef struct {
@@ -742,7 +978,6 @@ static int apng_load_precompose(const char *path, ApngAnim *A, int rotate180_all
 
     FrameBuild cur; memset(&cur,0,sizeof cur); bv_init(&cur.idata);
     unsigned canvas_w=0, canvas_h=0;
-    unsigned num_frames=0;
 
     // Composition canvas
     uint8_t *canvas=NULL,*canvas_prev=NULL;
@@ -763,7 +998,7 @@ static int apng_load_precompose(const char *path, ApngAnim *A, int rotate180_all
 
         if(memcmp(type,"acTL",4)==0){
             if(dlen!=8){ fprintf(stderr,"apng: bad acTL\n"); goto fail; }
-            acTL_frames = be32r(data+0); acTL_plays = be32r(data+4);
+            acTL_plays = be32r(data+4);
             saw_acTL=1;
             continue;
         }
@@ -1043,16 +1278,625 @@ static unsigned apng_pick_frame(const ApngAnim *A, uint64_t base_ms, double spee
     return idx;
 }
 
+// Video decoding via FFmpeg -----------------------------------------------------
+typedef struct {
+    AVFormatContext *format_ctx;
+    AVCodecContext *codec_ctx;
+    const AVCodec *codec;
+    struct SwsContext *sws_ctx;
+    AVFrame *frame;
+    AVFrame *frame_rgb;
+    AVPacket *packet;
+    int video_stream_idx;
+    int64_t duration_ms;
+    int64_t start_time;
+    int width, height;        // Original video dimensions
+    int target_width, target_height; // Target LCD dimensions (320x240)
+    uint8_t *rgb_buffer;      // RGB565 buffer from FFmpeg (scaled, not letterboxed)
+    uint8_t *letterbox_buffer; // RGB565 buffer for letterboxed result (320x320)
+    uint8_t *rgba_buffer;     // Temporary RGBA buffer for blitting
+    uint8_t *rotated_buffer;  // Buffer for rotated frame
+    int rotation_angle;       // 0, 90, 180, 270 degrees
+    int loaded;
+    int64_t current_pts;      // Current presentation timestamp
+    int64_t last_seek_pts;    // Last seek position
+    // Optimization: frame caching
+    uint8_t *cached_frame;    // Cached frame data
+    int64_t cached_pts;       // PTS of cached frame
+    int cache_valid;          // Is cache valid?
+    // Optimization: reduce seeking
+    int64_t last_request_pts; // Last requested PTS
+    int frame_skip_count;     // Count of frames to skip
+    // Video frame rate detection
+    float video_fps;          // Native video frame rate
+    int fps_detected;         // Whether FPS was successfully detected
+    
+    // Full video caching for short videos
+    uint8_t **cached_frames;  // Array of cached frame data
+    int *cached_timestamps;   // Array of frame timestamps in ms
+    int num_cached_frames;    // Number of frames in cache
+    int cache_enabled;        // Whether caching is enabled
+    int cache_loaded;         // Whether cache has been loaded
+} VideoDecoder;
+
+static void video_decoder_free(VideoDecoder *vd){
+    if(!vd) return;
+    if(vd->sws_ctx) sws_freeContext(vd->sws_ctx);
+    if(vd->frame) av_frame_free(&vd->frame);
+    if(vd->frame_rgb) av_frame_free(&vd->frame_rgb);
+    if(vd->packet) av_packet_free(&vd->packet);
+    if(vd->codec_ctx) avcodec_free_context(&vd->codec_ctx);
+    if(vd->format_ctx) avformat_close_input(&vd->format_ctx);
+    if(vd->rgb_buffer) free(vd->rgb_buffer);
+    if(vd->letterbox_buffer) free(vd->letterbox_buffer);
+    if(vd->rgba_buffer) free(vd->rgba_buffer);
+    if(vd->rotated_buffer) free(vd->rotated_buffer);
+    if(vd->cached_frame) free(vd->cached_frame);
+    
+    // Free video cache
+    if(vd->cached_frames && vd->num_cached_frames > 0){
+        for(int i = 0; i < vd->num_cached_frames; i++){
+            if(vd->cached_frames[i]) free(vd->cached_frames[i]);
+        }
+        free(vd->cached_frames);
+    }
+    if(vd->cached_timestamps) free(vd->cached_timestamps);
+    
+    memset(vd,0,sizeof *vd);
+}
+
+static int video_decoder_load(const char *path, VideoDecoder *vd, int rotation_angle){
+    memset(vd,0,sizeof *vd);
+    
+    // Initialize FFmpeg (av_register_all is deprecated in newer versions)
+    // av_register_all(); // Not needed in FFmpeg 4.0+
+    avformat_network_init();
+    
+    // Open input file
+    if(avformat_open_input(&vd->format_ctx, path, NULL, NULL) < 0){
+        fprintf(stderr,"video: could not open file %s\n", path);
+        return -1;
+    }
+    
+    // Find stream information
+    if(avformat_find_stream_info(vd->format_ctx, NULL) < 0){
+        fprintf(stderr,"video: could not find stream info\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Find video stream
+    vd->video_stream_idx = -1;
+    for(unsigned i = 0; i < vd->format_ctx->nb_streams; i++){
+        if(vd->format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO){
+            vd->video_stream_idx = i;
+            break;
+        }
+    }
+    
+    if(vd->video_stream_idx == -1){
+        fprintf(stderr,"video: no video stream found\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Get codec parameters
+    AVCodecParameters *codecpar = vd->format_ctx->streams[vd->video_stream_idx]->codecpar;
+    
+    // Find decoder
+    const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
+    if(!codec){
+        fprintf(stderr,"video: unsupported codec\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Allocate codec context
+    vd->codec_ctx = avcodec_alloc_context3(codec);
+    if(!vd->codec_ctx){
+        fprintf(stderr,"video: could not allocate codec context\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Copy codec parameters to context
+    if(avcodec_parameters_to_context(vd->codec_ctx, codecpar) < 0){
+        fprintf(stderr,"video: could not copy codec parameters\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Open codec
+    if(avcodec_open2(vd->codec_ctx, codec, NULL) < 0){
+        fprintf(stderr,"video: could not open codec\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Allocate frames
+    vd->frame = av_frame_alloc();
+    vd->frame_rgb = av_frame_alloc();
+    vd->packet = av_packet_alloc();
+    
+    if(!vd->frame || !vd->frame_rgb || !vd->packet){
+        fprintf(stderr,"video: could not allocate frames/packet\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Set target to 320x320 square for proper framebuffer fit
+    vd->target_width = 320;   // Square width (320)
+    vd->target_height = 320;  // Square height (320)
+    
+    // Calculate scaling to preserve aspect ratio
+    int src_w = vd->codec_ctx->width;
+    int src_h = vd->codec_ctx->height;
+    
+    // Calculate scale factor to fit within 320x320 while preserving aspect ratio
+    float scale_w = 320.0f / src_w;
+    float scale_h = 320.0f / src_h;
+    float scale = (scale_w < scale_h) ? scale_w : scale_h; // Use smaller scale to fit
+    
+    // Set dimensions to scaled size (not necessarily 320x320)
+    vd->width = (int)(src_w * scale);
+    vd->height = (int)(src_h * scale);
+    
+    
+    vd->sws_ctx = sws_getContext(src_w, src_h, vd->codec_ctx->pix_fmt,
+                                 vd->width, vd->height, AV_PIX_FMT_RGB565LE,
+                                 SWS_LANCZOS, NULL, NULL, NULL);
+    
+    if(!vd->sws_ctx){
+        fprintf(stderr,"video: could not create scaling context\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Allocate RGB565 buffer for scaled video
+    int rgb_size = av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, vd->width, vd->height, 1);
+    vd->rgb_buffer = (uint8_t*)malloc(rgb_size);
+    if(!vd->rgb_buffer){
+        fprintf(stderr,"video: could not allocate RGB565 buffer\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    av_image_fill_arrays(vd->frame_rgb->data, vd->frame_rgb->linesize,
+                         vd->rgb_buffer, AV_PIX_FMT_RGB565LE, vd->width, vd->height, 1);
+    
+    // Allocate letterbox buffer for 320x320 result
+    int letterbox_size = av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, 320, 320, 1);
+    vd->letterbox_buffer = (uint8_t*)malloc(letterbox_size);
+    if(!vd->letterbox_buffer){
+        fprintf(stderr,"video: could not allocate letterbox buffer\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Allocate temporary RGBA buffer for framebuffer blitting
+    int rgba_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, 320, 320, 1);
+    vd->rgba_buffer = (uint8_t*)malloc(rgba_size);
+    if(!vd->rgba_buffer){
+        fprintf(stderr,"video: could not allocate RGBA buffer\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    // Set up rotation to compensate for LCD hardware rotation
+    vd->rotation_angle = rotation_angle;
+    if(rotation_angle == 90 || rotation_angle == 270){
+        // For 90/270 degree rotation, dimensions are swapped
+        int rotated_size = av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, vd->height, vd->width, 1);
+        vd->rotated_buffer = (uint8_t*)malloc(rotated_size);
+        if(!vd->rotated_buffer){
+            fprintf(stderr,"video: could not allocate rotated RGB565 buffer\n");
+            video_decoder_free(vd);
+            return -1;
+        }
+    }
+    
+    // Get duration
+    if(vd->format_ctx->duration != AV_NOPTS_VALUE){
+        vd->duration_ms = vd->format_ctx->duration / 1000;
+    } else {
+        vd->duration_ms = 0; // Unknown duration
+    }
+    
+    vd->start_time = vd->format_ctx->streams[vd->video_stream_idx]->start_time;
+    if(vd->start_time == AV_NOPTS_VALUE) vd->start_time = 0;
+    
+    vd->current_pts = vd->start_time;
+    vd->last_seek_pts = vd->start_time;
+    vd->last_request_pts = vd->start_time;
+    vd->frame_skip_count = 0;
+    vd->cache_valid = 0;
+    vd->cached_pts = 0;
+    
+    // Detect video frame rate
+    AVRational frame_rate = vd->format_ctx->streams[vd->video_stream_idx]->r_frame_rate;
+    if(frame_rate.num > 0 && frame_rate.den > 0){
+        vd->video_fps = (float)frame_rate.num / (float)frame_rate.den;
+        vd->fps_detected = 1;
+    } else {
+        vd->video_fps = 24.0f; // Default fallback
+        vd->fps_detected = 0;
+    }
+    
+    // Allocate cache buffer for final LCD dimensions
+    int cache_size = av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, vd->target_width, vd->target_height, 1);
+    vd->cached_frame = (uint8_t*)malloc(cache_size);
+    if(!vd->cached_frame) {
+        fprintf(stderr, "Failed to allocate video cache RGB565 buffer\n");
+        video_decoder_free(vd);
+        return -1;
+    }
+    
+    vd->loaded = 1;
+    
+    // Enable caching for videos under 8 seconds (if enabled in config) - reduced to save memory
+    if(vd->duration_ms > 0 && vd->duration_ms < 8000){
+        vd->cache_enabled = 1; // Will be overridden by config if needed
+        fprintf(stderr,"[VIDEO] Caching available for short video (%lldms)\n", (long long)vd->duration_ms);
+    } else {
+        vd->cache_enabled = 0;
+    }
+    
+    fprintf(stderr,"[VIDEO] loaded: %dx%d, duration=%lldms, fps=%.1f (%s)\n",
+            vd->width, vd->height, (long long)vd->duration_ms, vd->video_fps, path);
+    
+    return 0;
+}
+
+
+// Convert RGB565 to RGBA for framebuffer blitting
+static void rgb565_to_rgba(const uint8_t *rgb565, uint8_t *rgba, int width, int height) {
+    for(int i = 0; i < width * height; i++) {
+        uint16_t pixel = ((uint16_t*)rgb565)[i];
+        
+        // Extract RGB565 components
+        uint8_t r = ((pixel & 0xF800) >> 8) | ((pixel & 0xE000) >> 13); // 5 bits -> 8 bits
+        uint8_t g = ((pixel & 0x07E0) >> 3) | ((pixel & 0x0600) >> 9);  // 6 bits -> 8 bits  
+        uint8_t b = ((pixel & 0x001F) << 3) | ((pixel & 0x001C) >> 2);  // 5 bits -> 8 bits
+        
+        rgba[i*4 + 0] = r;
+        rgba[i*4 + 1] = g;
+        rgba[i*4 + 2] = b;
+        rgba[i*4 + 3] = 255; // Alpha
+    }
+}
+
+// Scale video with letterboxing to fit 320x320 square
+static void scale_with_letterbox(const uint8_t *src, uint8_t *dst, int src_w, int src_h) {
+    // Calculate scale factor to fit within 320x320 while preserving aspect ratio
+    float scale_w = 320.0f / src_w;
+    float scale_h = 320.0f / src_h;
+    float scale = (scale_w < scale_h) ? scale_w : scale_h; // Use smaller scale to fit
+    
+    int scaled_w = (int)(src_w * scale);
+    int scaled_h = (int)(src_h * scale);
+    
+    // Calculate letterbox offsets to center the scaled video
+    int offset_x = (320 - scaled_w) / 2;
+    int offset_y = (320 - scaled_h) / 2;
+    
+    // Clear destination to black (letterboxing)
+    memset(dst, 0, 320 * 320 * 2); // RGB565 is 2 bytes per pixel
+    
+    // Scale and copy the video content
+    for(int y = 0; y < scaled_h; y++) {
+        for(int x = 0; x < scaled_w; x++) {
+            // Source coordinates
+            int src_x = (int)(x / scale);
+            int src_y = (int)(y / scale);
+            
+            // Clamp to source bounds
+            if(src_x >= src_w) src_x = src_w - 1;
+            if(src_y >= src_h) src_y = src_h - 1;
+            
+            // Destination coordinates (centered)
+            int dst_x = offset_x + x;
+            int dst_y = offset_y + y;
+            
+            // Copy RGB565 pixel (2 bytes)
+            int src_idx = (src_y * src_w + src_x) * 2;
+            int dst_idx = (dst_y * 320 + dst_x) * 2;
+            
+            dst[dst_idx + 0] = src[src_idx + 0]; // Low byte
+            dst[dst_idx + 1] = src[src_idx + 1]; // High byte
+        }
+    }
+}
+
+// Rotate square video without letterboxing (320x320 to 320x320) - RGB565 format
+static void rotate_square(uint8_t *src, uint8_t *dst, int size, int rotation) {
+    if(rotation == 0) {
+        // No rotation - direct copy
+        int frame_size = size * size * 2; // RGB565 is 2 bytes per pixel
+        memcpy(dst, src, frame_size);
+    } else if(rotation == 90) {
+        // 90° clockwise rotation: (x,y) -> (size-1-y, x)
+        for(int y = 0; y < size; y++) {
+            for(int x = 0; x < size; x++) {
+                int src_idx = (y * size + x) * 2; // RGB565 is 2 bytes per pixel
+                int dst_x = size - 1 - y;
+                int dst_y = x;
+                int dst_idx = (dst_y * size + dst_x) * 2;
+                
+                // Copy RGB565 pixel (2 bytes)
+                dst[dst_idx + 0] = src[src_idx + 0]; // Low byte
+                dst[dst_idx + 1] = src[src_idx + 1]; // High byte
+            }
+        }
+    } else if(rotation == -90) {
+        // -90° (270° clockwise) rotation: (x,y) -> (y, size-1-x)
+        for(int y = 0; y < size; y++) {
+            for(int x = 0; x < size; x++) {
+                int src_idx = (y * size + x) * 2; // RGB565 is 2 bytes per pixel
+                int dst_x = y;
+                int dst_y = size - 1 - x;
+                int dst_idx = (dst_y * size + dst_x) * 2;
+                
+                // Copy RGB565 pixel (2 bytes)
+                dst[dst_idx + 0] = src[src_idx + 0]; // Low byte
+                dst[dst_idx + 1] = src[src_idx + 1]; // High byte
+            }
+        }
+    }
+}
+
+// Load entire video into cache for short videos
+static int video_decoder_load_cache(VideoDecoder *vd){
+    if(!vd || !vd->cache_enabled || vd->cache_loaded) return 0;
+    
+    // Calculate number of frames to cache with frame skipping for performance
+    int total_frames = (int)((vd->duration_ms * vd->video_fps) / 1000.0f) + 1;
+    
+    // Skip frames for very long videos to reduce memory usage
+    int frame_skip = 1;
+    if(total_frames > 200) frame_skip = 2;  // Skip every other frame for >200 frames
+    if(total_frames > 400) frame_skip = 3;  // Skip 2/3 frames for >400 frames
+    
+    int cached_frames = (total_frames + frame_skip - 1) / frame_skip; // Ceiling division
+    int frame_size = av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, vd->target_width, vd->target_height, 1);
+    
+    fprintf(stderr,"[VIDEO] Loading %d frames into cache (%d MB total, skip=%d) - scaled from %dx%d to %dx%d\n", 
+            cached_frames, (cached_frames * frame_size) / (1024*1024), frame_skip,
+            vd->codec_ctx->width, vd->codec_ctx->height, vd->target_width, vd->target_height);
+    
+    // Allocate cache arrays
+    vd->cached_frames = (uint8_t**)calloc(cached_frames, sizeof(uint8_t*));
+    vd->cached_timestamps = (int*)calloc(cached_frames, sizeof(int));
+    if(!vd->cached_frames || !vd->cached_timestamps){
+        fprintf(stderr,"[VIDEO] Failed to allocate cache arrays\n");
+        return -1;
+    }
+    
+    // Seek to beginning
+    if(av_seek_frame(vd->format_ctx, vd->video_stream_idx, vd->start_time, AVSEEK_FLAG_BACKWARD) < 0){
+        fprintf(stderr,"[VIDEO] Failed to seek to beginning for caching\n");
+        return -1;
+    }
+    
+    avcodec_flush_buffers(vd->codec_ctx);
+    
+    int frame_count = 0;
+    int64_t current_time = 0;
+    
+    // Decode frames with skipping
+    int frames_decoded = 0;
+    while(av_read_frame(vd->format_ctx, vd->packet) >= 0 && frame_count < cached_frames){
+        if(vd->packet->stream_index == vd->video_stream_idx){
+            int ret = avcodec_send_packet(vd->codec_ctx, vd->packet);
+            if(ret < 0) {
+                av_packet_unref(vd->packet);
+                continue;
+            }
+            
+            while(ret >= 0 && frame_count < cached_frames){
+                ret = avcodec_receive_frame(vd->codec_ctx, vd->frame);
+                if(ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                if(ret < 0) break;
+                
+                // Skip frames based on frame_skip
+                if(frames_decoded % frame_skip != 0) {
+                    frames_decoded++;
+                    continue;
+                }
+                
+                // Convert to RGBA (scaled to fit LCD)
+                sws_scale(vd->sws_ctx, (const uint8_t* const*)vd->frame->data, vd->frame->linesize,
+                         0, vd->frame->height, vd->frame_rgb->data, vd->frame_rgb->linesize);
+                
+                // Allocate frame buffer for final LCD dimensions (RGB565) - reuse if possible
+                if(!vd->cached_frames[frame_count]) {
+                    vd->cached_frames[frame_count] = (uint8_t*)malloc(frame_size);
+                    if(!vd->cached_frames[frame_count]){
+                        fprintf(stderr,"[VIDEO] Failed to allocate RGB565 frame %d\n", frame_count);
+                        break;
+                    }
+                }
+                
+                // Apply letterboxing to make 320x320 square
+                scale_with_letterbox(vd->frame_rgb->data[0], vd->letterbox_buffer, vd->width, vd->height);
+                
+                // Rotate 320x320 square (RGB565)
+                rotate_square(vd->letterbox_buffer, vd->cached_frames[frame_count], 320, vd->rotation_angle);
+                vd->cached_timestamps[frame_count] = (int)current_time;
+                
+                frame_count++;
+                frames_decoded++;
+                current_time += (int64_t)(1000.0f / vd->video_fps); // Convert to milliseconds
+            }
+        }
+        av_packet_unref(vd->packet);
+    }
+    
+    vd->num_cached_frames = frame_count;
+    vd->cache_loaded = 1;
+    
+    fprintf(stderr,"[VIDEO] Cache loaded: %d frames (%d MB)\n", 
+            frame_count, (frame_count * frame_size) / (1024*1024));
+    
+    return 0;
+}
+
+static int video_decoder_get_frame(VideoDecoder *vd, uint64_t time_ms, uint8_t **out_rgba, int *out_w, int *out_h){
+    if(!vd || !vd->loaded) return -1;
+    
+    // Handle looping by wrapping time_ms
+    if(vd->duration_ms > 0 && time_ms >= (uint64_t)vd->duration_ms){
+        time_ms = time_ms % (uint64_t)vd->duration_ms;
+    }
+    
+    // Load cache if enabled and not yet loaded
+    if(vd->cache_enabled && !vd->cache_loaded){
+        video_decoder_load_cache(vd);
+    }
+    
+    // Use cached frames if available
+    if(vd->cache_loaded && vd->num_cached_frames > 0){
+        // Find the closest frame in cache
+        int best_frame = 0;
+        int best_diff = abs((int)time_ms - vd->cached_timestamps[0]);
+        
+        for(int i = 1; i < vd->num_cached_frames; i++){
+            int diff = abs((int)time_ms - vd->cached_timestamps[i]);
+            if(diff < best_diff){
+                best_diff = diff;
+                best_frame = i;
+            }
+        }
+        
+        // Convert cached RGB565 frame to RGBA for blitting
+        rgb565_to_rgba(vd->cached_frames[best_frame], vd->rgba_buffer, vd->target_width, vd->target_height);
+        
+        *out_rgba = vd->rgba_buffer;
+        *out_w = vd->target_width;   // Always 320x320 square
+        *out_h = vd->target_height;  // Always 320x320 square
+        return 0;
+    }
+    
+    // Fallback to original decoding for non-cached videos
+    int64_t target_pts = vd->start_time + (int64_t)(time_ms * AV_TIME_BASE / 1000);
+    
+    // Check cache first - if we have a cached frame close to target time, use it
+    if(vd->cache_valid){
+        int64_t cached_time_ms = (vd->cached_pts - vd->start_time) * 1000 / AV_TIME_BASE;
+        int64_t cache_diff = (int64_t)time_ms - cached_time_ms;
+        if(cache_diff < 0) cache_diff = -cache_diff;
+        
+        if(cache_diff < 100){ // Use cached frame if within 100ms
+            // Convert cached RGB565 frame to RGBA for blitting
+            rgb565_to_rgba(vd->cached_frame, vd->rgba_buffer, vd->target_width, vd->target_height);
+            
+            *out_rgba = vd->rgba_buffer;
+            *out_w = vd->target_width;   // Always 320x320 square
+            *out_h = vd->target_height;  // Always 320x320 square
+            return 0;
+        }
+    }
+    
+    // Check if we need to seek (only if we're far from current position)
+    int64_t pts_diff = target_pts - vd->current_pts;
+    if(pts_diff < 0) pts_diff = -pts_diff;
+    
+    // Only seek if we're more than 2 seconds away or at start
+    if(pts_diff > 2 * AV_TIME_BASE || vd->current_pts == vd->start_time){
+        // Seek to target position
+        if(av_seek_frame(vd->format_ctx, vd->video_stream_idx, target_pts, AVSEEK_FLAG_BACKWARD) < 0){
+            // If seek fails, start from beginning
+            av_seek_frame(vd->format_ctx, vd->video_stream_idx, vd->start_time, AVSEEK_FLAG_BACKWARD);
+            vd->current_pts = vd->start_time;
+        } else {
+            vd->current_pts = target_pts;
+        }
+        vd->last_seek_pts = vd->current_pts;
+        vd->cache_valid = 0; // Invalidate cache after seek
+        
+        // Flush codec buffers after seek
+        avcodec_flush_buffers(vd->codec_ctx);
+    }
+    
+    // Read and decode frames until we get one that's close to our target time
+    int frame_count = 0;
+    while(av_read_frame(vd->format_ctx, vd->packet) >= 0 && frame_count < 5){
+        if(vd->packet->stream_index == vd->video_stream_idx){
+            int ret = avcodec_send_packet(vd->codec_ctx, vd->packet);
+            if(ret < 0) {
+                av_packet_unref(vd->packet);
+                continue;
+            }
+            
+            ret = avcodec_receive_frame(vd->codec_ctx, vd->frame);
+            if(ret == 0){
+                frame_count++;
+                // Update current PTS
+                if(vd->frame->pts != AV_NOPTS_VALUE){
+                    vd->current_pts = vd->frame->pts;
+                }
+                
+                // Check if this frame is close enough to our target time
+                int64_t frame_time_ms = (vd->current_pts - vd->start_time) * 1000 / AV_TIME_BASE;
+                int64_t time_diff = (int64_t)time_ms - frame_time_ms;
+                if(time_diff < 0) time_diff = -time_diff;
+                
+                // If frame is close enough (within 150ms) or we're at the end, use it
+                if(time_diff < 150 || frame_time_ms >= (int64_t)time_ms || frame_count >= 3){
+                    // Convert to RGBA (scaled to fit LCD)
+                    sws_scale(vd->sws_ctx, (const uint8_t* const*)vd->frame->data, vd->frame->linesize,
+                              0, vd->frame->height, vd->frame_rgb->data, vd->frame_rgb->linesize);
+                    
+                    av_packet_unref(vd->packet);
+                    
+                    
+                    // Apply letterboxing to make 320x320 square
+                    scale_with_letterbox(vd->frame_rgb->data[0], vd->letterbox_buffer, vd->width, vd->height);
+                    
+                    // Rotate 320x320 square (RGB565)
+                    rotate_square(vd->letterbox_buffer, vd->rgb_buffer, 320, vd->rotation_angle);
+                    
+                    // Convert RGB565 to RGBA for framebuffer blitting
+                    rgb565_to_rgba(vd->rgb_buffer, vd->rgba_buffer, vd->target_width, vd->target_height);
+                    
+                    // Cache this frame for future use
+                    memcpy(vd->cached_frame, vd->rgb_buffer, av_image_get_buffer_size(AV_PIX_FMT_RGB565LE, vd->target_width, vd->target_height, 1));
+                    vd->cached_pts = vd->current_pts;
+                    vd->cache_valid = 1;
+                    
+                    *out_rgba = vd->rgba_buffer;
+                    *out_w = vd->target_width;   // Always 320x320 square
+                    *out_h = vd->target_height;  // Always 320x320 square
+                    return 0;
+                }
+            }
+        }
+        av_packet_unref(vd->packet);
+    }
+    
+    return -1;
+}
+
 // FB/Viewport & RGB565 -----------------------------------------------------------
-static int FBW= (W*3)/2, FBH= (H*3)/2;
-static void compute_fb(const Layout *L){ int p=(L->fb_scale_percent<100)?100:L->fb_scale_percent; FBW=(W*p+99)/100; FBH=(H*p+99)/100; }
+static int FBW= 400, FBH= 400;
+static void compute_fb(void){ 
+    // Make framebuffer larger than video to allow proper centering
+    // Video is 320x320, viewport extracts 240x320, so framebuffer should be larger
+    FBW = 400; 
+    FBH = 400; 
+}
 static void compute_viewport(const Layout *L, int *vx, int *vy){
     int x=(L->viewport_x<0)?(FBW - W)/2 : L->viewport_x;
-    int y=(L->viewport_y<0)?(FBH - H)/2 : L->viewport_y;
-    if(x<0)x=0; if(y<0)y=0; if(x>FBW-W)x=FBW-W; if(y>FBH-H)y=FBH-H; *vx=x; *vy=y;
+    int y=(L->viewport_y<0)?(FBH - H)/2 - 5 : L->viewport_y; // Adjust -5 lines for proper centering
+    if(x<0)x=0;
+    if(y<0)y=0;
+    if(x>FBW-W)x=FBW-W;
+    if(y>FBH-H)y=FBH-H;
+    *vx=x; *vy=y;
 }
 static uint8_t* viewport_to_rgb565(const uint8_t *fb,int fbw,int fbh,int vx,int vy){
-    (void)fbh; size_t px=(size_t)W*H; uint8_t *out=(uint8_t*)malloc(px*2); if(!out) die("malloc565");
+    (void)fbh; 
+    // Extract 240x320 viewport from 400x400 framebuffer for LCD
+    size_t px=(size_t)W*H; uint8_t *out=(uint8_t*)malloc(px*2); if(!out) die("malloc565");
     size_t j=0;
     for(int y=0;y<H;y++){
         const uint8_t *row = fb + 4*((vy+y)*fbw + vx);
@@ -1068,15 +1912,16 @@ static uint8_t* viewport_to_rgb565(const uint8_t *fb,int fbw,int fbh,int vx,int 
 }
 
 // USB robust sender --------------------------------------------------------------
-static void build_header_fixed(uint8_t hdr[PACK]){
+static void build_header_fixed(uint8_t hdr[PACK], int format, int frame_len){
     memset(hdr,0,PACK);
     hdr[0]=0xDA; hdr[1]=0xDB; hdr[2]=0xDC; hdr[3]=0xDD; // magic
     hdr[4]=0x02; hdr[5]=0x00;   // ver=2
     hdr[6]=0x01; hdr[7]=0x00;   // cmd=1
-    hdr[8]=0xF0; hdr[9]=0x00;   // H=240
-    hdr[10]=0x40; hdr[11]=0x01; // W=320
-    hdr[12]=0x02; hdr[13]=0x00; // fmt=2 (RGB565)
-    hdr[22]=0x00; hdr[23]=0x58; hdr[24]=0x02; hdr[25]=0x00; // frame_len = 0x00025800
+    hdr[8]=0x40; hdr[9]=0x01;   // H=320
+    hdr[10]=0xF0; hdr[11]=0x00; // W=240
+    hdr[12]=format & 0xFF; hdr[13]=(format >> 8) & 0xFF; // format (2=RGB565 only)
+    hdr[22]=frame_len & 0xFF; hdr[23]=(frame_len >> 8) & 0xFF; 
+    hdr[24]=(frame_len >> 16) & 0xFF; hdr[25]=(frame_len >> 24) & 0xFF; // frame_len
     hdr[26]=0x00; hdr[27]=0x00; hdr[28]=0x00; hdr[29]=0x08; // extra
 }
 static void ctrl_nudge(libusb_device_handle *h, uint16_t wIndex){ (void)h; (void)wIndex; }
@@ -1136,9 +1981,12 @@ static int out512_retry(libusb_context **pctx,libusb_device_handle **ph,int want
     return LIBUSB_ERROR_IO;
 }
 
-// Asset cache: background + images (static or APNG) ------------------------------
+// Asset cache: background + images (static, APNG, or video) ---------------------
 typedef struct {
-    int is_anim; ApngAnim anim; ImageRGBA stat;
+    int asset_type; // 0=static, 1=apng, 2=video
+    ApngAnim anim; 
+    ImageRGBA stat;
+    VideoDecoder video;
     int loaded;
     // playback knobs
     double speed; int64_t start_ms; int loop_mode; int loop_N;
@@ -1146,8 +1994,9 @@ typedef struct {
 
 static void asset_free(Asset *a){
     if(!a) return;
-    if(a->is_anim) apnganim_free(&a->anim);
-    else free_imgrgba(&a->stat);
+    if(a->asset_type == 1) apnganim_free(&a->anim);
+    else if(a->asset_type == 0) free_imgrgba(&a->stat);
+    else if(a->asset_type == 2) video_decoder_free(&a->video);
     memset(a,0,sizeof *a);
 }
 
@@ -1158,33 +2007,86 @@ int main(void){
     sa.sa_handler = on_sigterm; sigaction(SIGTERM, &sa, NULL);
     sa.sa_handler = on_sigterm; sigaction(SIGINT,  &sa, NULL);
 
+    // Set process priority to be nice to other processes
+    // This is a background display process, so it should have lower priority
+    int nice_value = 10; // Higher nice value = lower priority (0-19 range)
+    if(nice(nice_value) == -1) {
+        fprintf(stderr, "Warning: Could not set process priority (nice %d)\n", nice_value);
+    } else {
+        fprintf(stderr, "Process priority set to nice %d (lower priority for background operation)\n", nice_value);
+    }
+
     Layout L;
     if(load_layout("layout.cfg",&L)!=0){ fprintf(stderr,"Failed to load layout.cfg\n"); return 1; }
 
     // Compute FB and viewport
-    int FBW_local, FBH_local;
-    compute_fb(&L);
-    FBW_local = (W * L.fb_scale_percent + 99) / 100;
-    FBH_local = (H * L.fb_scale_percent + 99) / 100;
-    int fbw=FBW_local, fbh=FBH_local;
+    compute_fb();
+    // Use global FBW/FBH which are set to 400x400 for proper video centering
+    int fbw=FBW, fbh=FBH;
 
     // Preload background as asset
     Asset bg={0};
-    // Try APNG precompose (rotate all frames at load if background_flip)
-    int apng_stat = apng_load_precompose(L.background_png, &bg.anim, L.background_flip);
-    if(apng_stat==0 && bg.anim.is_apng){
-        bg.is_anim=1; bg.loaded=1;
-        bg.speed = L.bg_apng_speed; bg.start_ms = L.bg_apng_start_ms;
-        bg.loop_mode = L.bg_apng_loop_mode; bg.loop_N = L.bg_apng_loop_N;
-        fprintf(stderr,"[APNG] background: %u frames, plays=%u, total=%ums (%s)\n",
-                bg.anim.num_frames, bg.anim.plays, bg.anim.total_ms, L.background_png);
-    } else if(apng_stat==1){
-        // Static PNG fallback
-        ImageRGBA s = load_png_rgba_stb(L.background_png);
-        if(L.background_flip) rotate180_rgba(s.rgba, s.w, s.h);
-        bg.is_anim=0; bg.stat=s; bg.loaded=1;
+    
+    // Try video first if specified
+    if(L.background_video[0] != 0){
+        // Automatically rotate background 90° from text rotation
+        int video_rotation = 0;  // Will be calculated based on text orientation
+        
+        // Calculate background rotation based on text orientation
+        if(L.text_orient == ORIENT_LANDSCAPE) {
+            if(L.text_landscape_ccw) {
+                // Text: landscape CCW, Background: +90° (CW) from text
+                video_rotation = 90;
+                printf("[VIDEO] Text: landscape CCW, Background: +90° (CW) rotation\n");
+            } else {
+                // Text: landscape CW, Background: -90° (CCW) from text  
+                video_rotation = -90;
+                printf("[VIDEO] Text: landscape CW, Background: -90° (CCW) rotation\n");
+            }
+        } else {
+            // Text: portrait, Background: +90° (landscape) from text
+            video_rotation = 90;
+            printf("[VIDEO] Text: portrait, Background: +90° (landscape) rotation\n");
+        }
+        if(video_decoder_load(L.background_video, &bg.video, video_rotation) == 0){
+            bg.asset_type = 2; bg.loaded = 1;
+            bg.speed = L.bg_video_speed; bg.start_ms = L.bg_video_start_ms;
+            bg.loop_mode = L.bg_video_loop_mode; bg.loop_N = L.bg_video_loop_N;
+            
+            // Apply cache setting from config
+            if(!L.video_cache_enabled){
+                bg.video.cache_enabled = 0;
+                fprintf(stderr,"[VIDEO] Caching disabled by config\n");
+            } else if(bg.video.cache_enabled){
+                fprintf(stderr,"[VIDEO] Caching enabled for short video\n");
+            }
+            
+            fprintf(stderr,"[VIDEO] background: %dx%d, duration=%lldms, loop_mode=%d (%s)\n",
+                    bg.video.width, bg.video.height, (long long)bg.video.duration_ms, bg.loop_mode, L.background_video);
+        } else {
+            fprintf(stderr,"Failed to load video background: %s\n", L.background_video);
+            return 1;
+        }
+    } else if(L.background_png[0] != 0){
+        // Try APNG precompose (rotate all frames at load if background_flip)
+        int apng_stat = apng_load_precompose(L.background_png, &bg.anim, L.background_flip);
+        if(apng_stat==0 && bg.anim.is_apng){
+            bg.asset_type=1; bg.loaded=1;
+            bg.speed = L.bg_apng_speed; bg.start_ms = L.bg_apng_start_ms;
+            bg.loop_mode = L.bg_apng_loop_mode; bg.loop_N = L.bg_apng_loop_N;
+            fprintf(stderr,"[APNG] background: %u frames, plays=%u, total=%ums (%s)\n",
+                    bg.anim.num_frames, bg.anim.plays, bg.anim.total_ms, L.background_png);
+        } else if(apng_stat==1){
+            // Static PNG fallback
+            ImageRGBA s = load_png_rgba_stb(L.background_png);
+            if(L.background_flip) rotate180_rgba(s.rgba, s.w, s.h);
+            bg.asset_type=0; bg.stat=s; bg.loaded=1;
+        } else {
+            fprintf(stderr,"Failed to load background: %s\n", L.background_png);
+            return 1;
+        }
     } else {
-        fprintf(stderr,"Failed to load background: %s\n", L.background_png);
+        fprintf(stderr,"No background specified\n");
         return 1;
     }
 
@@ -1194,14 +2096,14 @@ int main(void){
         ApngAnim anim={0};
         int st = apng_load_precompose(L.imgs[i].path, &anim, 0);
         if(st==0 && anim.is_apng){
-            imgA[i].is_anim=1; imgA[i].anim=anim; imgA[i].loaded=1;
+            imgA[i].asset_type=1; imgA[i].anim=anim; imgA[i].loaded=1;
             imgA[i].speed=L.imgs[i].apng_speed; imgA[i].start_ms=L.imgs[i].apng_start_ms;
             imgA[i].loop_mode=L.imgs[i].apng_loop_mode; imgA[i].loop_N=L.imgs[i].apng_loop_N;
             fprintf(stderr,"[APNG] image[%d]: %u frames, plays=%u, total=%ums (%s)\n",
                     i, anim.num_frames, anim.plays, anim.total_ms, L.imgs[i].path);
         } else if(st==1){
             ImageRGBA s = load_png_rgba_stb(L.imgs[i].path);
-            imgA[i].is_anim=0; imgA[i].stat=s; imgA[i].loaded=1;
+            imgA[i].asset_type=0; imgA[i].stat=s; imgA[i].loaded=1;
         } else {
             fprintf(stderr,"Failed to load image layer: %s\n", L.imgs[i].path);
             imgA[i].loaded=0;
@@ -1220,51 +2122,113 @@ int main(void){
     }
     ensure_claim(h,iface);
     uint16_t wIndex=(uint16_t)iface;
-    uint8_t hdr[PACK]; build_header_fixed(hdr);
-    int period_ms=(L.fps>0)?(1000/L.fps):0;
+    uint8_t hdr[PACK];
+    // Use video's native frame rate if available, otherwise use config FPS
+    int target_fps = L.fps;
+    int original_fps = target_fps;
+    if(bg.asset_type == 2 && bg.video.loaded && bg.video.fps_detected){
+        target_fps = (int)bg.video.video_fps;
+        original_fps = target_fps;
+        printf("[VIDEO] Using native frame rate: %d FPS (from video)\n", target_fps);
+    } else if(L.fps > 0){
+        printf("[VIDEO] Using config frame rate: %d FPS\n", L.fps);
+    }
+    
+    int period_ms=(target_fps>0)?(1000/target_fps):0;
 
     Metrics M; metrics_init(&M);
     int frame_idx=0;
     uint64_t t0 = now_monotonic_ms();
+    
+    // Performance monitoring for frame rate adjustment
+    uint64_t last_perf_check = t0;
+    int perf_check_interval = 100; // Check performance every 100 frames
+    
+    // Optimization: reuse framebuffer to reduce allocations
+    uint8_t *fb = fb_rgba_alloc_clear(fbw, fbh);
+    if(!fb) die("Failed to allocate framebuffer");
 
     do{
-        uint8_t *fb = fb_rgba_alloc_clear(fbw, fbh);
+        // Clear framebuffer instead of reallocating
+        memset(fb, 0, (size_t)fbw * fbh * 4);
 
         // Update metrics (blocking sample on 1st frame if one-shot)
         update_metrics(&M, (frame_idx==0 && period_ms==0));
 
         // Background position
         int bgx=0,bgy=0;
-        if(bg.is_anim){
+        if(bg.asset_type == 2){ // Video
+            // Video frames are 320x320 square - center them in the framebuffer
+            bgx = (fbw - 320) / 2;  // Center horizontally (video width = 320)
+            bgy = (fbh - 320) / 2;  // Center vertically (video height = 320)
+            
+
+            uint64_t elapsed = now_monotonic_ms() - t0 + (uint64_t)(bg.start_ms>=0? bg.start_ms : 0);
+            elapsed = (uint64_t)((double)elapsed * bg.speed);
+            
+            // Handle looping
+            if(bg.video.duration_ms > 0){
+                if(bg.loop_mode == 1){ // infinite
+                    elapsed = elapsed % bg.video.duration_ms;
+                } else if(bg.loop_mode == 2){ // once
+                    if(elapsed >= (uint64_t)bg.video.duration_ms) elapsed = (uint64_t)bg.video.duration_ms - 1;
+                } else if(bg.loop_mode == 3){ // custom N
+                    uint64_t total_duration = bg.video.duration_ms * bg.loop_N;
+                    if(elapsed >= total_duration) elapsed = total_duration - 1;
+                    else elapsed = elapsed % bg.video.duration_ms;
+                }
+            }
+            
+            // Print video position every 100 frames
+            if(frame_idx % 100 == 0){
+                printf("[VIDEO] Position: %llu/%llu ms (%.1f%%) - Frame %d - Centered at (%d,%d)\n", 
+                       (unsigned long long)elapsed, (unsigned long long)bg.video.duration_ms,
+                       (float)elapsed * 100.0f / bg.video.duration_ms, frame_idx, bgx, bgy);
+            }
+            
+            uint8_t *frame_rgba = NULL;
+            int frame_w = 0, frame_h = 0;
+            if(video_decoder_get_frame(&bg.video, elapsed, &frame_rgba, &frame_w, &frame_h) == 0){
+                // Video frames are 320x320 square and centered
+                // Just blit them directly to the centered position
+                blit_png_into_fb(fb, fbw, fbh, frame_rgba, frame_w, frame_h, bgx, bgy, -1, 1.0f);
+            }
+        } else if(bg.asset_type == 1){ // APNG
             int bw=(int)bg.anim.canvas_w, bh=(int)bg.anim.canvas_h;
             bgx = L.bg_x_mode ? (fbw - bw)/2 : L.bg_x;
             bgy = L.bg_y_mode ? (fbh - bh)/2 : L.bg_y;
-            if(bgx<-bw) bgx=-bw; if(bgy<-bh) bgy=-bh; if(bgx>fbw) bgx=fbw; if(bgy>fbh) bgy=fbh;
+            if(bgx<-bw) bgx=-bw;
+            if(bgy<-bh) bgy=-bh;
+            if(bgx>fbw) bgx=fbw;
+            if(bgy>fbh) bgy=fbh;
 
             uint64_t elapsed = now_monotonic_ms() - t0 + (uint64_t)(bg.start_ms>=0? bg.start_ms : 0);
             unsigned rem_ms=0;
             unsigned idx = apng_pick_frame(&bg.anim, elapsed, bg.speed, bg.loop_mode, bg.loop_N, &rem_ms);
             const uint8_t *fr = bg.anim.frame_rgba[idx];
             blit_png_into_fb(fb,fbw,fbh, fr, bw,bh, bgx,bgy, -1, 1.0f);
-        } else {
+        } else { // Static PNG
             int bw=bg.stat.w, bh=bg.stat.h;
             bgx = L.bg_x_mode ? (fbw - bw)/2 : L.bg_x;
             bgy = L.bg_y_mode ? (fbh - bh)/2 : L.bg_y;
-            if(bgx<-bw) bgx=-bw; if(bgy<-bh) bgy=-bh; if(bgx>fbw) bgx=fbw; if(bgy>fbh) bgy=fbh;
+            if(bgx<-bw) bgx=-bw;
+            if(bgy<-bh) bgy=-bh;
+            if(bgx>fbw) bgx=fbw;
+            if(bgy>fbh) bgy=fbh;
             blit_png_into_fb(fb,fbw,fbh, bg.stat.rgba, bw,bh, bgx,bgy, -1, 1.0f);
         }
 
         // Image layers
         for(int i=0;i<L.n_imgs;i++){
             if(!imgA[i].loaded) continue;
-            if(imgA[i].is_anim){
+            if(imgA[i].asset_type == 1){ // APNG
                 const ApngAnim *A=&imgA[i].anim;
                 uint64_t elapsed = now_monotonic_ms() - t0 + (uint64_t)(imgA[i].start_ms>=0? imgA[i].start_ms : 0);
                 unsigned rem_ms=0;
                 unsigned idx = apng_pick_frame(A, elapsed, imgA[i].speed, imgA[i].loop_mode, imgA[i].loop_N, &rem_ms);
                 const uint8_t *fr = A->frame_rgba[idx];
                 blit_png_into_fb(fb,fbw,fbh, fr, (int)A->canvas_w,(int)A->canvas_h, L.imgs[i].x, L.imgs[i].y, L.imgs[i].alpha, L.imgs[i].scale>0?L.imgs[i].scale:1.0f);
-            } else {
+            } else { // Static PNG
                 blit_png_into_fb(fb,fbw,fbh, imgA[i].stat.rgba, imgA[i].stat.w,imgA[i].stat.h, L.imgs[i].x, L.imgs[i].y, L.imgs[i].alpha, L.imgs[i].scale>0?L.imgs[i].scale:1.0f);
             }
         }
@@ -1275,27 +2239,94 @@ int main(void){
         // Text
         for(int i=0;i<L.n_texts;i++) draw_text_ttf(fb,fbw,fbh,&L.texts[i],L.text_orient,L.text_flip,&L,&M);
 
-        // Viewport -> RGB565
+        // Prepare frame data
         int vx,vy; compute_viewport(&L,&vx,&vy);
-        uint8_t *rgb565 = viewport_to_rgb565(fb,fbw,fbh,vx,vy);
-
-        // Send
+        
+        
+        // Convert viewport to RGB565 (LCD only supports this format)
+        uint8_t *frame_data = viewport_to_rgb565(fb,fbw,fbh,vx,vy);
+        int frame_len = FRAME_LEN;
+        int format = 2; // RGB565
+        
+        // Build header with correct format and length
+        build_header_fixed(hdr, format, frame_len);
+        
+        // Send with frame validation
         ctrl_nudge(h,wIndex);
         int rc=out512_retry(&ctx,&h,L.iface,&iface,&ep_out,hdr,sizeof hdr);
-        if(rc){ fprintf(stderr,"header send failed rc=%d\n",rc); free(rgb565); free(fb); break; }
+        if(rc){ fprintf(stderr,"header send failed rc=%d\n",rc); free(frame_data); break; }
         ctrl_nudge(h,wIndex);
-        for(int off=0; off<FRAME_LEN; off+=PACK){
+        
+        // Track USB transmission success
+        int usb_errors = 0;
+        for(int off=0; off<frame_len; off+=PACK){
             ctrl_nudge(h,wIndex);
-            int n=(FRAME_LEN-off>=PACK)?PACK:(FRAME_LEN-off);
-            rc=out512_retry(&ctx,&h,L.iface,&iface,&ep_out,rgb565+off,n);
-            if(rc){ fprintf(stderr,"data send failed at off=%d rc=%d\n",off,rc); free(rgb565); free(fb); goto tx_done; }
+            int n=(frame_len-off>=PACK)?PACK:(frame_len-off);
+            rc=out512_retry(&ctx,&h,L.iface,&iface,&ep_out,frame_data+off,n);
+            if(rc){ 
+                usb_errors++;
+                fprintf(stderr,"data send failed at off=%d rc=%d (error %d)\n",off,rc,usb_errors); 
+                if(usb_errors > 3){
+                    fprintf(stderr,"Too many USB errors, stopping\n");
+                    free(frame_data); 
+                    goto tx_done; 
+                }
+            }
             ctrl_nudge(h,wIndex);
         }
-        free(rgb565);
-        free(fb);
+        
+        // If we had USB errors, increase frame interval to reduce load
+        if(usb_errors > 0 && target_fps > 6){
+            target_fps = 6; // Very conservative FPS
+            period_ms = (1000/target_fps);
+            printf("[VIDEO] USB errors detected, reducing to %d FPS for stability\n", target_fps);
+        }
+        free(frame_data);
 
         if(period_ms>0){ struct timespec ts; ts.tv_sec=period_ms/1000; ts.tv_nsec=(long)(period_ms%1000)*1000000L; nanosleep(&ts,NULL); }
         frame_idx++;
+        
+        // Performance monitoring - check if we need to reduce frame rate
+        if(frame_idx % perf_check_interval == 0){
+            uint64_t now = now_monotonic_ms();
+            uint64_t elapsed = now - last_perf_check;
+            uint64_t expected_time = (uint64_t)perf_check_interval * period_ms;
+            
+            // If we're taking significantly longer than expected, consider reducing FPS
+            if(elapsed > expected_time * 1.3f && target_fps > original_fps/2){ // More sensitive detection
+                if(target_fps > 16) {
+                    target_fps = 16; // First reduction
+                    printf("[VIDEO] Performance issue detected, reducing to %d FPS\n", target_fps);
+                } else if(target_fps > 12) {
+                    target_fps = 12; // Second reduction
+                    printf("[VIDEO] Performance issue detected, reducing to %d FPS\n", target_fps);
+                } else if(target_fps > 8) {
+                    target_fps = 8; // Third reduction
+                    printf("[VIDEO] Performance issue detected, reducing to %d FPS\n", target_fps);
+                }
+                period_ms = (target_fps > 0) ? (1000/target_fps) : 0;
+            }
+            
+            // USB bandwidth monitoring - if we're having transmission issues, reduce FPS further
+            if(target_fps > 6 && frame_idx > 30){ // Earlier detection, lower minimum
+                // Check if we're consistently behind schedule (USB bottleneck)
+                if(elapsed > expected_time * 1.15f){ // More sensitive detection
+                    if(target_fps > 12) {
+                        target_fps = 12; // First reduction
+                        printf("[VIDEO] USB bandwidth issue detected, reducing to %d FPS\n", target_fps);
+                    } else if(target_fps > 8) {
+                        target_fps = 8; // Second reduction
+                        printf("[VIDEO] USB bandwidth issue detected, reducing to %d FPS\n", target_fps);
+                    } else if(target_fps > 6) {
+                        target_fps = 6; // Final reduction
+                        printf("[VIDEO] USB bandwidth issue detected, reducing to %d FPS\n", target_fps);
+                    }
+                    period_ms = (1000/target_fps);
+                }
+            }
+            
+            last_perf_check = now;
+        }
 
         if (g_stop) break;
 
@@ -1307,8 +2338,12 @@ int main(void){
     } while(period_ms>0 && L.once==0);
 
 tx_done:
+    // Free the reused framebuffer
+    if(fb) free(fb);
+    
     if(h && iface>=0) libusb_release_interface(h,iface);
-    if(h) libusb_close(h); if(ctx) libusb_exit(ctx);
+    if(h) libusb_close(h);
+    if(ctx) libusb_exit(ctx);
 
     // Free assets
     if(bg.loaded) asset_free(&bg);

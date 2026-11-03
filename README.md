@@ -1,7 +1,10 @@
 # trlcd_libusb ThermalRight AIO Cooler LCD driver
 
 
-### What’s new
+### What's new
+- **v0.3.0**: Video background support via FFmpeg, fixed CPU temperature reading (168°C bug), optimized video playback performance
+- **Process Priority**: Runs with nice value 10 for better system responsiveness
+- **Video Optimizations**: Intelligent frame skipping, adaptive FPS reduction, improved USB handling
 - **Installer**: `./install.sh --user` or `sudo ./install.sh --system`
 - **APNG**: per-frame decode is tolerant (LodePNG first, stb_image fallback)
 - **USB**: better recovery (soft clear → reset → reopen)
@@ -16,18 +19,27 @@ sudo ./install.sh --system
 sudo systemctl restart trlcd
 ```
 
-Tiny single-file C program that composites PNG layers + text (with alpha) into RGB565 and streams frames to a 240×320 USB LCD (VID:PID **0416:5302**) over **libusb**.
+Tiny single-file C program that composites PNG/APNG/Video layers + text (with alpha) into RGB565 and streams frames to a 240×320 USB LCD (VID:PID **0416:5302**) over **libusb**.
 
-- Background PNG with transparency
+- Background PNG/APNG/Video with transparency
 - Movable background (center or explicit x/y)
-- Image layers (PNG, alpha)
+- Image layers (PNG, APNG, alpha)
 - Color overlays (RGBA)
-- Text with a small 5×7 bitmap font
+- Text with TTF fonts
   - Global **portrait/landscape** orientation, **CW/CCW** direction, optional **flip**
   - **Per-text overrides** (make one label vertical, keep others normal)
-- Live tokens: **`%CPU_TEMP%`**, **`%CPU_USAGE%`**
+- Live tokens: **`%CPU_TEMP%`**, **`%CPU_USAGE%`**, **`%MEM_USED%`**, **`%MEM_FREE%`**, **`%GPU_TEMP%`**, **`%GPU_USAGE%`**, **`%TIME%`**, **`%DATE%`**, **`%FAN_RPM%`**, **`%FAN_SPEED%`**, **`%CPU_FREQ%`**, **`%UPTIME%`**, **`%LOAD_AVG%`**
 - Large off-screen framebuffer + viewport (easy clipping / future animations)
 - Robust USB sender with auto-retry/reset/reopen
+- **Video background support** via FFmpeg (MP4, AVI, MOV, etc.)
+
+### Performance Features
+- **Adaptive FPS**: Automatically reduces frame rate (24→16→12→8→6 FPS) based on system performance
+- **Intelligent Caching**: Short videos (<8s) cached in RAM, long videos use frame skipping
+- **USB Bandwidth Monitoring**: Detects USB transmission issues and adjusts accordingly
+- **Process Priority**: Runs with nice value 10 to avoid interfering with system processes
+- **Memory Optimization**: Frame skipping for long videos (50-67% memory reduction)
+- **CPU Temperature**: Accurate readings from k10temp sensors (fixed 168°C bug)
 
 > **Repo contents**
 >
@@ -49,6 +61,7 @@ Tiny single-file C program that composites PNG layers + text (with alpha) into R
 - Linux
 - GCC or Clang
 - `libusb-1.0` development headers
+- `FFmpeg` development libraries (libavformat, libavcodec, libavutil, libswscale)
 - `stb_image.h` (included in this repo)
 
 Install libusb dev package:
@@ -56,36 +69,57 @@ Install libusb dev package:
 **Debian/Ubuntu**
 ```bash
 sudo apt-get update
-sudo apt-get install -y libusb-1.0-0-dev
+sudo apt-get install -y libusb-1.0-0-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
 **Fedora/RHEL**
 ```bash
-sudo dnf install libusb1-devel
+sudo dnf install libusb1-devel ffmpeg-devel
 ```
 
 **Arch**
 ```bash
-sudo pacman -S libusb
+sudo pacman -S libusb ffmpeg
 ```
 
 **openSUSE**
 ```bash
-sudo zypper install libusb-1_0-devel
+sudo zypper install libusb-1_0-devel ffmpeg4-devel
 ```
 
 ---
 
 ## Build
 
+### Using Makefile (Recommended)
+
 ```bash
-gcc -O2 -Wall trlcd_libusb.c -lusb-1.0 -o trlcd_libusb
+make                    # Build binary
+make check-deps         # Check dependencies
+make install            # Install system-wide
+make install-user       # Install for user
+make help               # Show all available targets
 ```
 
-> If you removed the `STBI_NO_LINEAR` define and see a linker error about `pow`, compile with `-lm`:
-> ```bash
-> gcc -O2 -Wall trlcd_libusb.c -lusb-1.0 -lm -o trlcd_libusb
-> ```
+### Manual Build
+
+```bash
+gcc -O2 -Wall trlcd_libusb.c lodepng.c -lusb-1.0 -lavformat -lavcodec -lavutil -lswscale -lm -o trlcd_libusb
+```
+
+> The installer script (`install.sh`) will automatically install dependencies and build the binary.
+
+### Makefile Features
+
+The included Makefile provides convenient targets for:
+
+- **Building**: `make` (default), `make debug`, `make release`
+- **Dependencies**: `make check-deps`, `make install-deps`, `make install-runtime-deps`
+- **Installation**: `make install` (system), `make install-user` (user)
+- **Services**: `make service-files`, `make udev-rules`
+- **Testing**: `make test`
+- **Distribution**: `make dist` (creates tar.gz package)
+- **Cleanup**: `make clean`, `make uninstall`
 
 ---
 
@@ -124,13 +158,20 @@ Put a `background.png` next to the binary, edit `layout.cfg` (see below), then:
 A minimal, working example:
 
 ```ini
-# Required background image (PNG with transparency is OK)
+# Required background (PNG, APNG, or video)
 background_png=background.png
+# OR for video backgrounds:
+# background_video=background.mp4
 
 # Move / align background (number or "center"). Optional 180° flip.
 background_x=center
 background_y=center
 background_flip=0
+
+# Video background controls (if using background_video)
+video_speed=1.0
+video_start_ms=0
+video_loop=infinite
 
 # Big off-screen framebuffer (as % of panel) and viewport crop
 fb_scale_percent=150
@@ -181,6 +222,20 @@ alpha=255
 scale=1.0
 ```
 
+### Video Background Support
+
+Video backgrounds are supported via FFmpeg and can use common formats like MP4, AVI, MOV, etc.
+
+**Video Loop Modes:**
+- `video_loop=infinite` - Loop forever (default)
+- `video_loop=once` - Play once and stop
+- `video_loop=default` - Use file's loop setting
+- `video_loop=N` - Loop N times (where N is a number)
+
+**Video Controls:**
+- `video_speed=1.0` - Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed)
+- `video_start_ms=0` - Start time offset in milliseconds
+
 ### Tokens
 
 - `%CPU_TEMP%` → like `42°C`. Reads Linux sensors from `/sys/class/thermal` and `/sys/class/hwmon`. If none available, prints `N/A`.
@@ -188,6 +243,11 @@ scale=1.0
     - Intel: `sudo modprobe coretemp`
     - AMD:   `sudo modprobe k10temp`
 - `%CPU_USAGE%` → like `37%`. Computed from `/proc/stat` deltas. On single-shot (`fps=0`) it takes a tiny (~60 ms) sample for a meaningful value.
+- `%FAN_RPM%` → like `1200 RPM`. Reads fan RPM from `/sys/class/hwmon/` sensors. Shows highest RPM found.
+- `%FAN_SPEED%` → like `65%`. Reads PWM fan speed percentage from `/sys/class/hwmon/` sensors.
+- `%CPU_FREQ%` → like `3.20 GHz`. Current CPU frequency from `/proc/cpuinfo`.
+- `%UPTIME%` → like `2d 5h 30m` or `3h 45m` or `25m`. System uptime in human-readable format.
+- `%LOAD_AVG%` → like `1.25`. 1-minute load average from `/proc/loadavg`.
 
 ### Orientation & overrides
 
